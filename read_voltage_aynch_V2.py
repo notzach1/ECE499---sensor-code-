@@ -8,39 +8,37 @@ from smbus2 import SMBus
 bus = SMBus(1)
 address = 0x48
 
-# Seconds between samples
+# Seconds between readings
 sample_rate = 10
 
-# Use a number to stop after that many samples
-# Use None to run continuously
-number_of_samples = None
+# Use a number, or None to run continuously
+number_of_samples = 30
 
 # Choose: ph, ec, turbidity, temperature, or all
 sensors = ["all"]
 
-# Choose: read, cal_ph7, cal_ph4, or cal_ec
+# Choose: read, calibrate_ph, or calibrate_ec
 mode = "read"
 
+# Enter these after pH calibration
+ph7_cal_voltage = 0.0
+ph4_cal_voltage = 0.0
 
-# Add these values after calibration
-ph7_cal_voltage = None
-ph4_cal_voltage = None
+# Enter this after EC calibration
 ec_cal_factor = 1.0
 
-# EC calibration solution
+calibration_samples = 30
+calibration_delay = 0.2
 ec_standard_ppm = 707.0
-
-# Number of readings used during calibration
-cal_samples = 30
-cal_delay = 0.2
-cal_settle_time = 10
-
 
 temp_files = glob.glob("/sys/bus/w1/devices/28-*/w1_slave")
 
 
-async def read_adc(channel):
+def sensor_on(name):
+    return "all" in sensors or name in sensors
 
+
+async def read_adc(channel):
     config = 0x8183 | ((4 + channel) << 12)
 
     bus.write_i2c_block_data(
@@ -55,48 +53,35 @@ async def read_adc(channel):
     reading = (data[0] << 8) | data[1]
 
     if reading >= 32768:
-        reading = reading - 65536
+        reading -= 65536
 
-    voltage = reading * 6.144 / 32768
-
-    return voltage
+    return reading * 6.144 / 32768
 
 
 def read_temp():
-
-    if len(temp_files) == 0:
+    if not temp_files:
         return None
 
-    file = open(temp_files[0], "r")
-    data = file.read()
-    file.close()
+    with open(temp_files[0], "r") as file:
+        lines = file.read().splitlines()
 
-    if "YES" not in data or "t=" not in data:
+    if len(lines) < 2 or not lines[0].strip().endswith("YES"):
         return None
 
-    temp = float(data.split("t=")[1]) / 1000
-
-    return temp
-
-
-def convert_ph(voltage):
-
-    if ph7_cal_voltage is None or ph4_cal_voltage is None:
+    try:
+        return float(lines[1].split("t=")[1]) / 1000
+    except (IndexError, ValueError):
         return None
 
-    if ph7_cal_voltage == ph4_cal_voltage:
-        return None
 
+def get_ph(voltage):
     slope = (4.0 - 7.0) / (ph4_cal_voltage - ph7_cal_voltage)
-    ph = 7.0 + slope * (voltage - ph7_cal_voltage)
 
-    return ph
+    return 7.0 + slope * (voltage - ph7_cal_voltage)
 
 
-def calculate_tds(voltage, temperature, cal_factor):
-
-    temp_adjustment = 1.0 + 0.02 * (temperature - 25.0)
-    corrected_voltage = voltage / temp_adjustment
+def get_tds(voltage, temperature, factor):
+    corrected_voltage = voltage / (1 + 0.02 * (temperature - 25))
 
     tds = (
         133.42 * corrected_voltage**3
@@ -104,236 +89,121 @@ def calculate_tds(voltage, temperature, cal_factor):
         + 857.39 * corrected_voltage
     ) * 0.5
 
-    tds = tds * cal_factor
-
-    if tds < 0:
-        tds = 0
-
-    return tds
+    return max(0, tds * factor)
 
 
-async def average_adc(channel):
+async def average_voltage(channel):
+    total = 0
 
-    readings = []
+    for _ in range(calibration_samples):
+        total += await read_adc(channel)
+        await asyncio.sleep(calibration_delay)
 
-    for sample in range(cal_samples):
-
-        voltage = await read_adc(channel)
-        readings.append(voltage)
-
-        print(
-            "Calibration reading",
-            sample + 1,
-            ":",
-            round(voltage, 4),
-            "V"
-        )
-
-        await asyncio.sleep(cal_delay)
-
-    average = sum(readings) / len(readings)
-
-    return average
+    return total / calibration_samples
 
 
 async def calibrate():
+    if mode == "calibrate_ph":
+        value = await average_voltage(0)
+        print(f"{value:.5f}")
 
-    print("Waiting for the sensor to settle...")
-    await asyncio.sleep(cal_settle_time)
+    elif mode == "calibrate_ec":
+        temperature = read_temp() or 25.0
+        voltage = await average_voltage(1)
+        raw_tds = get_tds(voltage, temperature, 1.0)
+        factor = ec_standard_ppm / raw_tds
 
-    if mode == "cal_ph7":
-
-        print("Calibrating pH sensor with pH 7.00 solution")
-
-        average_voltage = await average_adc(0)
-
-        print("-----------------------")
-        print("pH 7 calibration voltage:", round(average_voltage, 5), "V")
-        print("Enter this value into ph7_cal_voltage")
-
-    elif mode == "cal_ph4":
-
-        print("Calibrating pH sensor with pH 4.00 solution")
-
-        average_voltage = await average_adc(0)
-
-        print("-----------------------")
-        print("pH 4 calibration voltage:", round(average_voltage, 5), "V")
-        print("Enter this value into ph4_cal_voltage")
-
-    elif mode == "cal_ec":
-
-        print("Calibrating EC estimate with 707 ppm solution")
-
-        temperature = read_temp()
-
-        if temperature is None:
-            temperature = 25.0
-            print("Temperature sensor not detected")
-            print("Using 25 C")
-
-        average_voltage = await average_adc(1)
-
-        uncalibrated_tds = calculate_tds(
-            average_voltage,
-            temperature,
-            1.0
-        )
-
-        if uncalibrated_tds <= 0:
-            print("Calibration failed")
-            return
-
-        factor = ec_standard_ppm / uncalibrated_tds
-
-        print("-----------------------")
-        print("EC calibration voltage:", round(average_voltage, 5), "V")
-        print("Temperature:", round(temperature, 2), "C")
-        print("Uncalibrated TDS:", round(uncalibrated_tds, 2), "ppm")
-        print("EC calibration factor:", round(factor, 6))
-        print("Enter this value into ec_cal_factor")
-
-    else:
-        print("Calibration mode not recognized")
+        print(f"{factor:.6f}")
 
 
-async def main():
+async def collect_data():
+    count = 0
+    loop = asyncio.get_running_loop()
+    next_sample = loop.time()
 
-    if mode != "read":
-        await calibrate()
-        return
+    while number_of_samples is None or count < number_of_samples:
+        count += 1
 
-    if sample_rate <= 0:
-        print("Sample rate must be greater than zero")
-        return
+        output = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ]
 
-    if number_of_samples is not None and number_of_samples <= 0:
-        print("Number of samples must be greater than zero")
-        return
+        temperature = None
 
-    sample_count = 0
+        if sensor_on("temperature") or sensor_on("ec"):
+            temperature = read_temp()
 
-    while number_of_samples is None or sample_count < number_of_samples:
+        if sensor_on("ph"):
+            voltage = await read_adc(0)
 
-        start_time = asyncio.get_running_loop().time()
-
-        sample_count = sample_count + 1
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        print("Sample:", sample_count)
-
-        temp = None
-
-        if (
-            "all" in sensors
-            or "temperature" in sensors
-            or "ec" in sensors
-        ):
-            temp = read_temp()
-
-        if "all" in sensors or "ph" in sensors:
-
-            ph_voltage = await read_adc(0)
-            ph = convert_ph(ph_voltage)
-
-            if ph is None:
-                print(
-                    timestamp,
-                    "- pH not calibrated:",
-                    round(ph_voltage, 3),
-                    "V"
-                )
+            if ph7_cal_voltage > 0 and ph4_cal_voltage > 0:
+                output.append(f"pH: {get_ph(voltage):.2f}")
             else:
-                print(
-                    timestamp,
-                    "- pH:",
-                    round(ph, 2),
-                    "- Voltage:",
-                    round(ph_voltage, 3),
-                    "V"
-                )
+                output.append(f"pH voltage: {voltage:.3f} V")
 
-        if "all" in sensors or "ec" in sensors:
-
-            ec_voltage = await read_adc(1)
-
-            if temp is None:
-                ec_temperature = 25.0
-            else:
-                ec_temperature = temp
-
-            tds = calculate_tds(
-                ec_voltage,
-                ec_temperature,
+        if sensor_on("ec"):
+            voltage = await read_adc(1)
+            tds = get_tds(
+                voltage,
+                temperature or 25.0,
                 ec_cal_factor
             )
 
-            estimated_ec_us = tds * 2
-            estimated_ec_ms = estimated_ec_us / 1000
+            estimated_ec = tds * 2 / 1000
 
-            print(
-                timestamp,
-                "- Estimated EC:",
-                round(estimated_ec_ms, 3),
-                "mS/cm"
+            output.append(
+                f"Estimated EC: {estimated_ec:.3f} mS/cm"
             )
 
-            print(
-                timestamp,
-                "- TDS:",
-                round(tds, 1),
-                "ppm",
-                "- Voltage:",
-                round(ec_voltage, 3),
-                "V"
+            output.append(
+                f"TDS: {tds:.1f} ppm"
             )
 
-        if "all" in sensors or "turbidity" in sensors:
+        if sensor_on("turbidity"):
+            voltage = await read_adc(2)
 
-            turbidity_voltage = await read_adc(2)
-
-            print(
-                timestamp,
-                "- Turbidity voltage:",
-                round(turbidity_voltage, 3),
-                "V"
+            output.append(
+                f"Turbidity voltage: {voltage:.3f} V"
             )
 
-        if "all" in sensors or "temperature" in sensors:
-
-            if temp is None:
-                print(timestamp, "- Temperature sensor not detected")
+        if sensor_on("temperature"):
+            if temperature is None:
+                output.append("Temperature: unavailable")
             else:
-                print(
-                    timestamp,
-                    "- Temperature:",
-                    round(temp, 2),
-                    "C"
+                output.append(
+                    f"Temperature: {temperature:.2f} C"
                 )
 
-        print("-----------------------")
+        print(
+            "\n".join(output)
+            + "\n------------------------------"
+        )
 
-        if (
-            number_of_samples is not None
-            and sample_count >= number_of_samples
-        ):
+        if number_of_samples is not None and count >= number_of_samples:
             break
 
-        time_used = asyncio.get_running_loop().time() - start_time
-        time_left = sample_rate - time_used
+        next_sample += sample_rate
+        wait_time = next_sample - loop.time()
 
-        if time_left > 0:
-            await asyncio.sleep(time_left)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
 
-    print("Finished collecting", sample_count, "samples")
+
+async def main():
+    if mode == "read":
+        await collect_data()
+    else:
+        await calibrate()
 
 
 try:
     asyncio.run(main())
 
 except KeyboardInterrupt:
-    print("stopped")
+    pass
 
 finally:
     bus.close()
 ```
+
+::: 
